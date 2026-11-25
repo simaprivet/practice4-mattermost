@@ -14,6 +14,7 @@ env:
   COMPOSE_FILE: docker-compose.prod.yml
   MIGRATION_ASSIST_IMAGE: mm-migration-assist:v0.8
   PGLOADER_IMAGE: mattermost/mattermost-pgloader:latest
+  ARTIFACTS_DIR: artifacts      # папка внутри рабочей копии; её содержимое уходит в артефакты
 
 defaults:
   run:
@@ -70,6 +71,7 @@ jobs:
 
       # 2. Резервная копия MySQL (и тома с файлами) перед началом работ
       - name: Backup Legacy MySQL
+        id: backup
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
           if ! docker ps --format '{{.Names}}' | grep -qx "mattermost-mysql"; then
@@ -116,6 +118,7 @@ jobs:
 
       # 3. Поднятие целевого PostgreSQL (только БД, приложение ещё не трогаем)
       - name: Start Target PostgreSQL
+        id: start_pg
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
           docker compose -f "$COMPOSE_FILE" up -d --wait db-postgres
@@ -125,6 +128,7 @@ jobs:
       #    Если прошлый запуск упал посередине переноса, таблицы удаляются и создаются
       #    заново, а не дублируются. Шаг можно запускать сколько угодно раз.
       - name: Reset target schema (include drop)
+        id: reset_schema
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
           docker exec -i mattermost-postgres psql -v ON_ERROR_STOP=1 -U mmuser -d mattermost <<'SQL'
@@ -138,9 +142,15 @@ jobs:
 
       # 5. Подготовка: образ migration-assist, исходная БД, схема PostgreSQL
       - name: Prepare migration (migration-assist)
+        id: prepare
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker build -q -t "$MIGRATION_ASSIST_IMAGE" ./migration
+          # Сборка с повторами: сеть может обрываться при скачивании Go-модулей
+          for i in 1 2 3; do
+            docker build -t "$MIGRATION_ASSIST_IMAGE" ./migration && break
+            [ "$i" = 3 ] && { echo "::error::Failed to build migration-assist image (network?)"; exit 1; }
+            echo "Build failed (attempt $i), retrying in 15s..."; sleep 15
+          done
 
           rm -rf "$WORK_DIR" && mkdir -p "$WORK_DIR"
           export MYSQL_DSN="root:${DB_MYSQL_ROOT_PASSWORD}@tcp(mattermost-mysql:3306)/mattermost"
@@ -164,7 +174,9 @@ jobs:
 
           echo "🔎 [1/3] Checking & fixing MySQL schema..."
           # shellcheck disable=SC2016
-          ma 'migration-assist mysql "$MYSQL_DSN" --fix-artifacts --fix-unicode --fix-varchar'
+          # Вывод команды (список применённых миграций) сохраняется в mysql.output —
+          # как в официальной инструкции Mattermost: "... --fix-varchar > mysql.output"
+          ma 'migration-assist mysql "$MYSQL_DSN" --fix-artifacts --fix-unicode --fix-varchar > mysql.stdout; rc=$?; cat mysql.stdout; [ -s mysql.output ] || cp mysql.stdout mysql.output; exit $rc'
 
           echo "🏗  [2/3] Creating PostgreSQL schema of the SAME version as source (9.5)..."
           # shellcheck disable=SC2016
@@ -179,6 +191,7 @@ jobs:
 
       # 6. Гетерогенная миграция данных MySQL -> PostgreSQL официальным образом pgloader
       - name: Run pgloader
+        id: pgloader
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
           echo "🔄 Migrating data from MySQL to PostgreSQL..."
@@ -204,6 +217,7 @@ jobs:
 
       # 7. Маркерный флаг-файл успешной миграции
       - name: Mark Migration as Completed
+        id: mark
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
           {
@@ -215,6 +229,7 @@ jobs:
 
       # 8. Развертывание обновлённого стека (выполняется при КАЖДОМ запуске)
       - name: Deploy Upgraded Stack
+        id: deploy
         run: |
           echo "🚀 Launching Upgraded Mattermost Stack..."
           # --remove-orphans остановит и удалит старый контейнер mattermost-mysql
@@ -224,6 +239,7 @@ jobs:
 
       # 9. Автоматическая проверка работоспособности и сохранности данных
       - name: Run Health Checks & Verify Data
+        id: health
         run: |
           echo "🧪 Running Smoke Tests..."
           echo "⏳ Waiting for Mattermost to apply internal database updates (up to 5 min)..."
@@ -280,6 +296,144 @@ jobs:
             ORDER BY p.createat DESC LIMIT 10;"
 
           echo "✅ Mattermost upgraded successfully and running on Postgres!"
+
+      # 10. Сбор полного комплекта артефактов — ВСЕГДА, даже если какой-то шаг упал
+      - name: Collect artifacts
+        if: always()
+        run: |
+          set +e   # сбор артефактов сам по себе не должен ронять пайплайн
+          A="$ARTIFACTS_DIR"
+          rm -rf "$A" && mkdir -p "$A/docker" "$A/logs" "$A/db" "$A/migration" "$A/tests"
+
+          # --- 1. Отчёт: что запускалось и чем закончился каждый шаг ---
+          {
+            echo "# Mattermost migration report"
+            echo
+            echo "- date (UTC): $(date -u +%FT%TZ)"
+            echo "- run: #$GITHUB_RUN_NUMBER, attempt $GITHUB_RUN_ATTEMPT (run id $GITHUB_RUN_ID)"
+            echo "- branch: $GITHUB_REF_NAME"
+            echo "- commit: $GITHUB_SHA"
+            echo "- runner: $RUNNER_NAME ($RUNNER_OS, self-hosted)"
+            echo "- already migrated before this run: ${{ steps.check_status.outputs.already_migrated }}"
+            echo
+            echo "## Steps"
+            echo
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| Check Migration Status | ${{ steps.check_status.outcome }} |"
+            echo "| Backup Legacy MySQL | ${{ steps.backup.outcome }} |"
+            echo "| Start Target PostgreSQL | ${{ steps.start_pg.outcome }} |"
+            echo "| Reset target schema (include drop) | ${{ steps.reset_schema.outcome }} |"
+            echo "| Prepare migration (migration-assist) | ${{ steps.prepare.outcome }} |"
+            echo "| Run pgloader | ${{ steps.pgloader.outcome }} |"
+            echo "| Mark Migration as Completed | ${{ steps.mark.outcome }} |"
+            echo "| Deploy Upgraded Stack | ${{ steps.deploy.outcome }} |"
+            echo "| Run Health Checks & Verify Data | ${{ steps.health.outcome }} |"
+            echo
+            echo "skipped = шаг пропущен, потому что миграция уже была выполнена (идемпотентность)"
+          } > "$A/report.md"
+
+          # --- 2. Результаты проверок приложения ---
+          PING_CODE="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8065/api/v4/system/ping)"
+          curl -s "http://localhost:8065/api/v4/system/ping?get_server_status=true" > "$A/tests/api-ping.json"
+          UI_CODE="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8065/)"
+          VERSION="$(curl -sI http://localhost:8065/api/v4/system/ping | awk -F': ' 'tolower($1)=="x-version-id"{print $2}' | tr -d '\r')"
+          {
+            echo
+            echo "## Tests"
+            echo
+            echo "- API /api/v4/system/ping: HTTP $PING_CODE"
+            echo "- Web UI /: HTTP $UI_CODE"
+            echo "- Mattermost version: ${VERSION:-unknown}"
+          } >> "$A/report.md"
+
+          # --- 3. Данные из базы ---
+          if docker ps --format '{{.Names}}' | grep -qx "mattermost-postgres"; then
+            docker exec mattermost-postgres psql -U mmuser -d mattermost -c "
+              SELECT (SELECT COUNT(*) FROM users)    AS users,
+                     (SELECT COUNT(*) FROM teams)    AS teams,
+                     (SELECT COUNT(*) FROM channels) AS channels,
+                     (SELECT COUNT(*) FROM posts WHERE deleteat = 0) AS posts;" \
+              > "$A/db/postgres-counts.txt" 2>&1
+            docker exec mattermost-postgres psql -U mmuser -d mattermost -c "
+              SELECT to_timestamp(p.createat / 1000)::timestamp(0) AS created,
+                     u.username, c.displayname AS channel, left(p.message, 80) AS message
+              FROM posts p
+              JOIN users u    ON u.id = p.userid
+              JOIN channels c ON c.id = p.channelid
+              WHERE p.type = '' AND p.deleteat = 0
+              ORDER BY p.createat DESC LIMIT 20;" \
+              > "$A/db/postgres-last-messages.txt" 2>&1
+            PG_POSTS="$(docker exec mattermost-postgres psql -U mmuser -d mattermost -tAc \
+                        "SELECT COUNT(*) FROM posts WHERE deleteat = 0;" 2>/dev/null)"
+            echo "- posts in PostgreSQL: ${PG_POSTS:-n/a}" >> "$A/report.md"
+          fi
+          if [ -f "$POSTS_COUNT_FILE" ]; then
+            cp "$POSTS_COUNT_FILE" "$A/db/mysql-posts-count-before-migration.txt"
+            echo "- posts in MySQL before migration: $(tr -d '[:space:]' < "$POSTS_COUNT_FILE")" >> "$A/report.md"
+          fi
+          [ -f "$MIGRATION_FLAG" ] && cp "$MIGRATION_FLAG" "$A/migration-flag.txt"
+
+          # --- 4. Состояние Docker ---
+          docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' > "$A/docker/docker-ps.txt" 2>&1
+          docker images > "$A/docker/docker-images.txt" 2>&1
+          docker volume ls > "$A/docker/docker-volumes.txt" 2>&1
+          docker network inspect mattermost_network > "$A/docker/network-mattermost_network.json" 2>&1
+          docker compose -f "$COMPOSE_FILE" ps -a > "$A/docker/compose-ps.txt" 2>&1
+          docker compose -f "$COMPOSE_FILE" config > "$A/docker/compose-config-resolved.yml" 2>&1
+
+          # --- 5. Логи контейнеров ---
+          for c in mattermost mattermost-postgres mattermost-mysql; do
+            if docker ps -a --format '{{.Names}}' | grep -qx "$c"; then
+              docker logs "$c" > "$A/logs/$c.log" 2>&1
+            fi
+          done
+
+          # --- 6. Файлы миграции (лог pgloader, его конфиг, список миграций) ---
+          if [ -d "$WORK_DIR" ]; then
+            cp -r "$WORK_DIR"/. "$A/migration/" 2>/dev/null
+          fi
+
+          # --- 7. Бэкапы: список файлов (сами файлы — отдельным артефактом) ---
+          ls -la "$BACKUP_DIR" > "$A/backups-list.txt" 2>&1
+
+          # --- 8. Какие секреты использовались (без значений) ---
+          printf 'DB_MYSQL_ROOT_PASSWORD=***\nDB_POSTGRES_PASSWORD=***\n' > "$A/secrets-used.txt"
+
+          # --- 9. Вычищаем пароли из ВСЕХ файлов артефакта ---
+          # GitHub маскирует секреты только в логе на странице, но не внутри файлов
+          for S in "$DB_MYSQL_ROOT_PASSWORD" "$DB_POSTGRES_PASSWORD"; do
+            [ -n "$S" ] || continue
+            grep -rlF -- "$S" "$A" | while read -r f; do
+              S="$S" perl -pi -e 's/\Q$ENV{S}\E/***/g' "$f"
+            done
+          done
+          if grep -rqF -- "$DB_POSTGRES_PASSWORD" "$A" || grep -rqF -- "$DB_MYSQL_ROOT_PASSWORD" "$A"; then
+            echo "::error::Secret found in artifacts after sanitizing"; exit 1
+          fi
+
+          { echo; echo "## Files in this artifact"; echo; (cd "$A" && find . -type f | sort | sed 's/^/- /'); } >> "$A/report.md"
+          cat "$A/report.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "Artifacts collected:"; (cd "$A" && find . -type f | sort)
+
+      - name: Upload report, logs and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-report-run${{ github.run_number }}-attempt${{ github.run_attempt }}
+          path: ${{ env.ARTIFACTS_DIR }}/
+          retention-days: 30
+
+      # Бэкап MySQL и архив тома с файлами — только в том прогоне, где бэкап делался
+      - name: Upload backups
+        if: always() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-run${{ github.run_number }}
+          path: |
+            ${{ env.BACKUP_DIR }}/mattermost_mysql_backup_${{ github.run_id }}_*.sql.gz
+            ${{ env.BACKUP_DIR }}/mattermost_data_${{ github.run_id }}_*.tar.gz
+          retention-days: 7
 
       # Временные файлы содержат пароли в конфиге pgloader — удаляем всегда
       - name: Cleanup temporary files

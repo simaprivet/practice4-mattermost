@@ -9,3 +9,6 @@ legacy/.env
 migration.load
 mysql.output
 pgloader.log
+
+# Папка, которую workflow собирает в артефакты
+artifacts/

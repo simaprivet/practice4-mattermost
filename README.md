@@ -89,6 +89,8 @@ GitHub → вкладка **Actions** → *Idempotent Mattermost Migration & Upg
 | Mark Migration as Completed | создаёт флаг-файл |
 | Deploy Upgraded Stack | `docker compose up -d --build --remove-orphans` → Mattermost 12.0.1, MySQL удалён |
 | Run Health Checks & Verify Data | `/api/v4/system/ping` = 200, версия 12.0.1, драйвер postgres, MySQL отсутствует, число сообщений не уменьшилось, вывод последних сообщений |
+| Collect artifacts | **всегда** (даже при ошибке): отчёт по шагам, тесты, данные из PostgreSQL, логи контейнеров, состояние Docker, логи pgloader; пароли вычищаются из файлов |
+| Upload … | артефакты `migration-report-runN-attemptM` (30 дней) и `backup-runN` — дамп MySQL + архив тома (7 дней) |
 
 ## 3. Прогон №2 (проверка идемпотентности)
 
@@ -97,6 +99,19 @@ GitHub → вкладка **Actions** → *Idempotent Mattermost Migration & Upg
 - `git commit --allow-empty -m "re-run" && git push`.
 
 Шаги бэкапа и миграции будут **skipped** (серые), прогон займёт ~30–60 секунд и тоже будет **Success**.
+
+## Артефакты прогона
+
+Внизу страницы прогона, блок **Artifacts**:
+
+| Артефакт | Что внутри |
+|---|---|
+| `migration-report-runN-attemptM` | `report.md` — итог каждого шага (success / skipped / failure) и тестов; `tests/api-ping.json`; `db/` — число пользователей/каналов/сообщений и последние сообщения из PostgreSQL, число сообщений в MySQL до миграции; `logs/` — логи контейнеров mattermost, postgres (и mysql, если был); `docker/` — `docker ps`, образы, тома, сеть, итоговый compose-конфиг; `migration/` — лог pgloader, его конфиг, список миграций; `migration-flag.txt`; `backups-list.txt`; `secrets-used.txt` (только имена) |
+| `backup-runN` | `mattermost_mysql_backup_….sql.gz` (дамп MySQL) и `mattermost_data_….tar.gz` (аватары, вложения). Только в прогоне, где делался бэкап |
+
+Артефакты собираются шагом с `if: always()` — даже если прогон упал, логи для разбора всё равно сохранятся.
+Пароли из файлов заменяются на `***` (GitHub прячет секреты только в логе на странице, а не внутри файлов);
+если пароль всё-таки остался — шаг падает. Полный текстовый лог прогона: на странице прогона ⋯ → *Download log archive*.
 
 ## 4. Ручная проверка
 
@@ -139,6 +154,8 @@ curl -s http://localhost:8065/api/v4/system/ping        # {"status":"OK",...}
 - Шаг *Reset target schema (include drop)*: перед каждой попыткой переноса схема удаляется целиком, поэтому
   при перезапуске упавшего пайплайна таблицы не дублируются (см. объяснение в п. 6).
 - Шаг *Deploy* — `--remove-orphans`, именно он удалил `mattermost-mysql`.
+
+**Артефакты.** Внизу страницы прогона → *Artifacts* → скачайте `migration-report-…`, откройте `report.md`: таблица шагов, результаты тестов, число сообщений до/после. Во втором прогоне шаги миграции там `skipped`.
 
 **Критерий 4. Тестирование (2 б.)**
 - Лог шага *Run Health Checks & Verify Data*: `HTTP 200`, версия `12.0.1…`, «running on PostgreSQL»,
