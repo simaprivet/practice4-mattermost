@@ -9,7 +9,8 @@
 │   ├── docker-compose.yml        # старый стек: Mattermost 9.5 + MySQL 8.0
 │   └── .env.example              # пароли legacy-стека (копируется в legacy/.env)
 ├── docker-compose.prod.yml       # новый стек: Mattermost 12.0.1 + PostgreSQL 15
-├── migration/Dockerfile          # образ с утилитой migration-assist
+├── migration/Dockerfile          # образ с утилитой migration-assist (из официальной сборки, без интернета)
+├── migration/migration-assist-Linux-x86_64.tar.gz  # официальный релиз v0.8, проверка SHA-256
 ├── .github/workflows/migration.yml
 ├── scripts/reset-lab.sh          # полный сброс стенда для повторной репетиции
 ├── .env.example
@@ -182,7 +183,8 @@ curl -s http://localhost:8065/api/v4/system/ping        # {"status":"OK",...}
    `data only` опция `include drop` ничего не делает — таблицы создаёт не pgloader. Явное удаление схемы
    перед каждой попыткой даёт тот же результат: повторный запуск начинает с чистой схемы.
 6. **Флаг-файл в `$HOME` пользователя раннера**, а не жёстко `/home/runner` — у вас пользователь может называться иначе.
-7. `sleep` заменён на ожидание healthcheck/цикл опроса; добавлены `concurrency` (нет параллельных прогонов),
+7. **migration-assist берётся из официальной готовой сборки v0.8** (архив в `migration/`, проверка SHA-256), а не собирается `go install`: сборка из исходников требует доступа к Go-зеркалам и падала по сети. Образ собирается только из `alpine:3.20`, интернет не нужен.
+8. `sleep` заменён на ожидание healthcheck/цикл опроса; добавлены `concurrency` (нет параллельных прогонов),
    бэкап тома с файлами, сверка числа сообщений.
 
 ---

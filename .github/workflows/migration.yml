@@ -145,12 +145,8 @@ jobs:
         id: prepare
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          # Сборка с повторами: сеть может обрываться при скачивании Go-модулей
-          for i in 1 2 3; do
-            docker build -t "$MIGRATION_ASSIST_IMAGE" ./migration && break
-            [ "$i" = 3 ] && { echo "::error::Failed to build migration-assist image (network?)"; exit 1; }
-            echo "Build failed (attempt $i), retrying in 15s..."; sleep 15
-          done
+          # Образ из официальной готовой сборки (лежит в migration/), сеть не нужна
+          docker build -t "$MIGRATION_ASSIST_IMAGE" ./migration
 
           rm -rf "$WORK_DIR" && mkdir -p "$WORK_DIR"
           export MYSQL_DSN="root:${DB_MYSQL_ROOT_PASSWORD}@tcp(mattermost-mysql:3306)/mattermost"
@@ -174,9 +170,8 @@ jobs:
 
           echo "🔎 [1/3] Checking & fixing MySQL schema..."
           # shellcheck disable=SC2016
-          # Вывод команды (список применённых миграций) сохраняется в mysql.output —
-          # как в официальной инструкции Mattermost: "... --fix-varchar > mysql.output"
-          ma 'migration-assist mysql "$MYSQL_DSN" --fix-artifacts --fix-unicode --fix-varchar > mysql.stdout; rc=$?; cat mysql.stdout; [ -s mysql.output ] || cp mysql.stdout mysql.output; exit $rc'
+          # Утилита сама записывает список применённых миграций в mysql.output (флаг --output, по умолчанию)
+          ma 'migration-assist mysql "$MYSQL_DSN" --fix-artifacts --fix-unicode --fix-varchar'
 
           echo "🏗  [2/3] Creating PostgreSQL schema of the SAME version as source (9.5)..."
           # shellcheck disable=SC2016

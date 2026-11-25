@@ -6,6 +6,8 @@ legacy/.env
 *.sql
 *.sql.gz
 *.tar.gz
+# ...кроме официальной сборки migration-assist (нужна для сборки образа без интернета)
+!migration/migration-assist-Linux-x86_64.tar.gz
 migration.load
 mysql.output
 pgloader.log
